@@ -31,7 +31,7 @@ from rich.table import Table
 # Add project src to path if running from repo root
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-from ariadne_dbt.capsule import CapsuleBuilder
+from ariadne_dbt.capsule import CapsuleBuilder, _estimate_tokens
 from ariadne_dbt.config import CapsuleConfig
 from ariadne_dbt.graph import GraphOps
 from ariadne_dbt.indexer import Indexer
@@ -134,9 +134,9 @@ def main(manifest_path: Path) -> None:
         # ── 4. Lineage traversal ──────────────────────────────────────────────
         console.print("  [dim]Benchmarking lineage traversal...[/dim]")
         graph = GraphOps(conn)
-        top = graph.high_centrality_models(limit=1)
+        top = graph.get_high_centrality_models(limit=1)
         if top:
-            uid = top[0][0]
+            uid = top[0]["unique_id"]
             lineage_times = _timeit(lambda: (
                 graph.upstream(uid, depth=3),
                 graph.downstream(uid, depth=3),
@@ -153,12 +153,47 @@ def main(manifest_path: Path) -> None:
         results.append(("Pattern extraction", pattern_times, "<200ms"))
 
         # ── Token reduction ───────────────────────────────────────────────────
+        # Both sides use the same estimator: chars / 4 (_estimate_tokens).
+        # Naive baseline = what an agent would get if it dumped every model's
+        # full definition (SQL, columns, description, tests, sources, macros)
+        # — i.e. the entire context without intelligent selection.
         capsule = builder.build(task="explore the project", token_budget=10000)
-        rows = conn.execute(
-            "SELECT COALESCE(description,'') || ' ' || COALESCE(raw_code,'') FROM models"
+
+        model_rows = conn.execute(
+            "SELECT unique_id, name, description, raw_code, compiled_code, "
+            "layer, materialization, tags FROM models"
         ).fetchall()
-        naive_tokens = sum(len(r[0].split()) for r in rows)
-        reduction_pct = (1 - capsule.token_estimate / naive_tokens) * 100 if naive_tokens else 0
+        naive_parts: list[str] = []
+        for m in model_rows:
+            cols = conn.execute(
+                "SELECT name, data_type, description FROM columns WHERE model_id = ?",
+                (m["unique_id"],),
+            ).fetchall()
+            col_text = ", ".join(
+                f"{c['name']} {c['data_type'] or ''} {c['description'] or ''}".strip()
+                for c in cols
+            )
+            naive_parts.append(
+                f"{m['name']} [{m['layer']}/{m['materialization']}] "
+                f"{m['description'] or ''}\n"
+                f"columns: {col_text}\n"
+                f"{m['raw_code'] or ''}"
+            )
+
+        # Add tests
+        test_rows = conn.execute("SELECT name, test_type, model_id, column_name FROM tests").fetchall()
+        for t in test_rows:
+            naive_parts.append(f"test: {t['name']} ({t['test_type']}) on {t['model_id']} {t['column_name']}")
+
+        # Add sources
+        source_rows = conn.execute("SELECT name, source_name, description FROM sources").fetchall()
+        for s in source_rows:
+            naive_parts.append(f"source: {s['source_name']}.{s['name']} {s['description'] or ''}")
+
+        naive_text = "\n\n".join(naive_parts)
+        naive_tokens = _estimate_tokens(naive_text)
+        capsule_tokens = capsule.token_estimate
+        reduction_pct = (1 - capsule_tokens / naive_tokens) * 100 if naive_tokens else 0
 
         conn.close()
 
@@ -199,8 +234,8 @@ def main(manifest_path: Path) -> None:
     summary.add_row("Index build time", f"{index_time * 1000:.0f}ms")
     summary.add_row("Throughput", f"{throughput:.0f} models/sec")
     summary.add_row("Peak RSS delta", f"{rss_delta_mb:.1f} MB")
-    summary.add_row("Capsule tokens", str(capsule.token_estimate))
-    summary.add_row("Naive tokens", str(naive_tokens))
+    summary.add_row("Capsule tokens (chars/4)", str(capsule_tokens))
+    summary.add_row("Naive tokens (chars/4)", str(naive_tokens))
     summary.add_row("Token reduction", f"{reduction_pct:.1f}%")
     console.print(summary)
 

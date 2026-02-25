@@ -193,18 +193,21 @@ class Indexer:
         fqn: list[str] = node.get("fqn", [])
         name: str = node.get("name", "")
         depends_on_nodes: list[str] = node.get("depends_on", {}).get("nodes", [])
-        refs: list[str] = [r[0] if isinstance(r, list) else r for r in node.get("refs", [])]
+        refs: list[str] = [
+            r["name"] if isinstance(r, dict) else (r[0] if isinstance(r, list) else r)
+            for r in node.get("refs", [])
+        ]
         sources_list: list[str] = [
             ".".join(s) if isinstance(s, list) else s for s in node.get("sources", [])
         ]
         columns_raw: dict[str, Any] = node.get("columns", {})
         columns = [
             ColumnInfo(
-                name=c.get("name", cname),
-                data_type=c.get("data_type", ""),
-                description=c.get("description", ""),
-                meta=c.get("meta", {}),
-                tags=c.get("tags", []),
+                name=c.get("name") or cname,
+                data_type=c.get("data_type") or "",
+                description=c.get("description") or "",
+                meta=c.get("meta") or {},
+                tags=c.get("tags") or [],
             )
             for cname, c in columns_raw.items()
         ]
@@ -262,9 +265,9 @@ class Indexer:
             cols_raw: dict[str, Any] = src.get("columns", {})
             columns = [
                 ColumnInfo(
-                    name=c.get("name", cname),
-                    data_type=c.get("data_type", ""),
-                    description=c.get("description", ""),
+                    name=c.get("name") or cname,
+                    data_type=c.get("data_type") or "",
+                    description=c.get("description") or "",
                 )
                 for cname, c in cols_raw.items()
             ]
