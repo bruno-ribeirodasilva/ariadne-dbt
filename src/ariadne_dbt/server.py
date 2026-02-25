@@ -1,8 +1,9 @@
-"""FastMCP server with 5 MVP tools for dbt Context Engine."""
+"""FastMCP server with tools for Ariadne."""
 
 from __future__ import annotations
 
 import sqlite3
+import time
 from pathlib import Path
 from typing import Any
 
@@ -14,6 +15,10 @@ from .graph import GraphOps
 from .indexer import Indexer
 from .patterns import PatternExtractor
 from .search import HybridSearch
+from .usage import UsageLogger
+
+# Tracks the most-recent capsule log_id per db_path for rate_capsule
+_last_capsule_log_id: dict[Path, int] = {}
 
 
 # ── Server factory ────────────────────────────────────────────────────────────
@@ -28,7 +33,8 @@ def create_server(config: EngineConfig | None = None) -> FastMCP:
             "Intelligent context server for dbt projects. "
             "Use get_context_capsule as the primary tool — it returns a pre-filtered, "
             "token-budgeted context package for any dbt task. "
-            "Call refresh_index after running dbt compile to keep the index current."
+            "Call refresh_index after running dbt compile to keep the index current. "
+            "Call rate_capsule after completing a task to record whether the context was useful."
         ),
     )
 
@@ -64,7 +70,19 @@ def create_server(config: EngineConfig | None = None) -> FastMCP:
         """
         conn = _get_conn(db_path)
         builder = CapsuleBuilder(conn, cfg.capsule)
+        t0 = time.perf_counter()
         capsule = builder.build(task=task, focus_model=focus_model, token_budget=token_budget)
+        duration_ms = round((time.perf_counter() - t0) * 1000)
+        log_id = UsageLogger(conn).log(
+            "get_context_capsule",
+            task_text=task,
+            intent=capsule.intent,
+            focus_model=focus_model,
+            pivot_count=len(capsule.pivot_models),
+            token_estimate=capsule.token_estimate,
+            duration_ms=duration_ms,
+        )
+        _last_capsule_log_id[db_path] = log_id
         return capsule.model_dump()
 
     # ── Tool: get_model_details ───────────────────────────────────────────────
@@ -224,12 +242,21 @@ def create_server(config: EngineConfig | None = None) -> FastMCP:
         search = HybridSearch(conn)
         limit = min(max(1, limit), 50)
 
+        t0 = time.perf_counter()
         results = search.search(query, intent="explore", limit=limit * 2)
 
         if layer:
             results = [r for r in results if r.layer == layer]
 
         results = results[:limit]
+        duration_ms = round((time.perf_counter() - t0) * 1000)
+
+        UsageLogger(conn).log(
+            "search_models",
+            task_text=query,
+            token_estimate=sum(len(r.description or "") // 4 for r in results),
+            duration_ms=duration_ms,
+        )
 
         return {
             "query": query,
@@ -292,6 +319,32 @@ def create_server(config: EngineConfig | None = None) -> FastMCP:
             "catalog_included": cfg.catalog_path.exists(),
             "run_results_included": cfg.run_results_path.exists(),
         }
+
+    # ── Tool: rate_capsule ────────────────────────────────────────────────────
+
+    @mcp.tool()
+    def rate_capsule(
+        rating: int,
+        notes: str | None = None,
+    ) -> dict[str, Any]:
+        """Rate the most recent get_context_capsule call (1–5 stars).
+
+        Call this after completing a task to record whether the context capsule
+        was useful. Ratings are stored locally and used to improve Ariadne over time.
+
+        Args:
+            rating: 1 (useless) to 5 (perfect — had exactly what I needed)
+            notes: Optional free-text note, e.g. "missing upstream source tables"
+
+        Returns:
+            Confirmation with the log_id that was rated
+        """
+        log_id = _last_capsule_log_id.get(db_path)
+        if log_id is None:
+            return {"success": False, "error": "No capsule call found in this session yet."}
+        conn = _get_conn(db_path)
+        UsageLogger(conn).rate(log_id, rating, notes)
+        return {"success": True, "log_id": log_id, "rating": rating}
 
     return mcp
 

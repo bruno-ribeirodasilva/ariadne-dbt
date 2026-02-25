@@ -1,4 +1,4 @@
--- dbt Context Engine SQLite Schema
+-- Ariadne SQLite Schema
 -- All artifact data from manifest.json, catalog.json, run_results.json
 
 PRAGMA journal_mode = WAL;
@@ -161,6 +161,26 @@ CREATE TABLE IF NOT EXISTS column_lineage (
 
 CREATE INDEX IF NOT EXISTS idx_collin_target ON column_lineage(target_model_id, target_column);
 CREATE INDEX IF NOT EXISTS idx_collin_source ON column_lineage(source_model_id, source_column);
+
+-- ─── Usage log ───────────────────────────────────────────────────────────────
+
+CREATE TABLE IF NOT EXISTS usage_log (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts              TEXT NOT NULL,          -- ISO8601 UTC timestamp
+    tool_name       TEXT NOT NULL,          -- get_context_capsule | search_models | ...
+    task_text       TEXT,                   -- the task / query string
+    intent          TEXT,                   -- detected intent (capsule only)
+    focus_model     TEXT,                   -- anchor model if provided
+    pivot_count     INTEGER,                -- pivot models returned (capsule only)
+    token_estimate  INTEGER,                -- estimated tokens in response
+    duration_ms     INTEGER,                -- wall-clock ms for tool call
+    rating          INTEGER,                -- 1–5 from rate_capsule (nullable)
+    notes           TEXT                    -- free-text note from rating
+);
+
+CREATE INDEX IF NOT EXISTS idx_usage_log_ts        ON usage_log(ts);
+CREATE INDEX IF NOT EXISTS idx_usage_log_tool      ON usage_log(tool_name);
+CREATE INDEX IF NOT EXISTS idx_usage_log_intent    ON usage_log(intent);
 
 -- ─── Session events (v1.0, created now to avoid schema migrations) ────────────
 

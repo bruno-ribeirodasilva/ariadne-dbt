@@ -243,3 +243,122 @@ def stats(
     table.add_row("Exposures", str(project_stats.exposure_count))
     console.print(table)
     conn.close()
+
+
+@app.command()
+def usage(
+    project_root: Optional[Path] = typer.Argument(None),
+    days: int = typer.Option(30, "--days", "-d", help="Look-back window in days"),
+    recent: bool = typer.Option(False, "--recent", "-r", help="Show 20 most recent queries"),
+) -> None:
+    """Show Ariadne usage statistics.
+
+    Displays how the MCP server has been used: call counts by tool and intent,
+    average token estimates, top queried models, and daily trends.
+    """
+    import sqlite3 as _sqlite3
+
+    from .usage import UsageLogger
+
+    cfg = load_config(project_root)
+
+    if not cfg.absolute_index_path.exists():
+        console.print(
+            "[red]Error:[/red] Index not found. Run [bold]ariadne init[/bold] first."
+        )
+        raise typer.Exit(1)
+
+    conn = _sqlite3.connect(str(cfg.absolute_index_path))
+    conn.row_factory = _sqlite3.Row
+    logger = UsageLogger(conn)
+
+    if recent:
+        rows = logger.recent_queries(limit=20)
+        table = Table(title="Recent Queries (last 20)", border_style="blue")
+        table.add_column("ID", style="dim")
+        table.add_column("Time (UTC)", style="dim")
+        table.add_column("Tool")
+        table.add_column("Intent")
+        table.add_column("Task / Query", max_width=50)
+        table.add_column("Tokens", justify="right")
+        table.add_column("ms", justify="right")
+        table.add_column("★", justify="center")
+        for r in rows:
+            table.add_row(
+                str(r["id"]),
+                (r["ts"] or "")[:16].replace("T", " "),
+                r["tool_name"],
+                r["intent"] or "",
+                (r["task_text"] or "")[:50],
+                str(r["token_estimate"] or ""),
+                str(r["duration_ms"] or ""),
+                str(r["rating"] or ""),
+            )
+        console.print(table)
+        conn.close()
+        return
+
+    s = logger.get_stats(days=days)
+    conn.close()
+
+    if s["total_calls"] == 0:
+        console.print(
+            f"[yellow]No usage data for the last {days} days.[/yellow]\n"
+            "Start the MCP server and run some queries to populate the log."
+        )
+        return
+
+    # ── Summary ───────────────────────────────────────────────────────────────
+    summary = Table(
+        title=f"Ariadne Usage — last {days} days",
+        border_style="green",
+        show_header=False,
+    )
+    summary.add_column("Metric", style="bold")
+    summary.add_column("Value", justify="right")
+    summary.add_row("Total calls", str(s["total_calls"]))
+    if s["avg_token_estimate"]:
+        summary.add_row("Avg token estimate", f"{s['avg_token_estimate']:,}")
+    if s["avg_duration_ms"]:
+        summary.add_row("Avg duration", f"{s['avg_duration_ms']} ms")
+    if s["avg_rating"]:
+        summary.add_row("Avg rating", f"{s['avg_rating']} / 5.0")
+    console.print(summary)
+
+    # ── By tool ───────────────────────────────────────────────────────────────
+    if s["by_tool"]:
+        t = Table(title="Calls by tool", border_style="blue")
+        t.add_column("Tool")
+        t.add_column("Calls", justify="right")
+        for tool, count in sorted(s["by_tool"].items(), key=lambda x: -x[1]):
+            t.add_row(tool, str(count))
+        console.print(t)
+
+    # ── By intent ─────────────────────────────────────────────────────────────
+    if s["by_intent"]:
+        t = Table(title="Capsule calls by intent", border_style="blue")
+        t.add_column("Intent")
+        t.add_column("Calls", justify="right")
+        for intent, count in sorted(s["by_intent"].items(), key=lambda x: -x[1]):
+            t.add_row(intent, str(count))
+        console.print(t)
+
+    # ── Top queried models ────────────────────────────────────────────────────
+    if s["top_models"]:
+        t = Table(title="Top queried models", border_style="blue")
+        t.add_column("Model")
+        t.add_column("Calls", justify="right")
+        for entry in s["top_models"]:
+            t.add_row(entry["model"], str(entry["calls"]))
+        console.print(t)
+
+    # ── Daily calls ───────────────────────────────────────────────────────────
+    if len(s["daily_calls"]) > 1:
+        t = Table(title="Daily calls", border_style="dim")
+        t.add_column("Date")
+        t.add_column("Calls", justify="right")
+        max_calls = max(r["calls"] for r in s["daily_calls"])
+        for row in s["daily_calls"]:
+            bar_len = round(row["calls"] / max_calls * 20) if max_calls else 0
+            t.add_row(row["date"], f"{'█' * bar_len} {row['calls']}")
+        console.print(t)
