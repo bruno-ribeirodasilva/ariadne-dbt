@@ -1,0 +1,46 @@
+# ariadne configuration
+# Copy this file to ariadne.toml in your dbt project root
+
+[project]
+# Path to dbt project root (default: current directory)
+# dbt_project_root = "."
+
+# Path to dbt target directory containing manifest.json
+# target_dir = "target"
+
+# Path to store the SQLite index (default: .ariadne/index.db)
+# index_path = ".ariadne/index.db"
+
+[server]
+# MCP server host and port
+host = "127.0.0.1"
+port = 8765
+
+# Enable file watcher for auto-reindex when manifest.json changes
+watch = true
+
+[capsule]
+# Default token budget for get_context_capsule (in tokens, approximate)
+default_token_budget = 10000
+
+# Maximum pivot models to include in a capsule
+max_pivots = 3
+
+# Maximum upstream/downstream hops for each intent type
+[capsule.intent_depths]
+debug = { upstream = 2, downstream = 1 }
+add_feature = { upstream = 1, downstream = 2 }
+refactor = { upstream = 1, downstream = 3 }
+test = { upstream = 0, downstream = 0 }
+document = { upstream = 1, downstream = 1 }
+explore = { upstream = 1, downstream = 1 }
+
+[generator]
+# Whether to generate .claude/ files on init
+generate_claude_md = true
+generate_skills = true
+generate_context_snapshots = true
+
+# Target agent tools to generate rules for
+# Supported: "claude_code", "cursor", "windsurf"
+targets = ["claude_code"]

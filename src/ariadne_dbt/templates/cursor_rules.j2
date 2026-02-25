@@ -1,0 +1,37 @@
+---
+description: dbt project context rules for {{ stats.project_name or "this project" }}
+globs: ["models/**/*.sql", "models/**/*.yml", "*.yml"]
+alwaysApply: true
+---
+
+# {{ stats.project_name or "dbt Project" }} — AI Agent Rules
+
+## Project Context
+- **Adapter**: {{ stats.adapter_type }}
+- **Models**: {{ stats.model_count }} ({{ stats.staging_count }} staging, {{ stats.intermediate_count }} intermediate, {{ stats.marts_count }} marts)
+- **Sources**: {{ stats.source_count }}
+
+## Naming Conventions
+- Staging: `{{ patterns.naming.staging_pattern }}`
+- Intermediate: `{{ patterns.naming.intermediate_pattern }}`
+- Marts: `{{ patterns.naming.marts_pattern }}`
+
+## Materialization
+- Staging: `{{ patterns.naming.staging_materialization }}`
+- Intermediate: `{{ patterns.naming.intermediate_materialization }}`
+- Marts: `{{ patterns.naming.marts_materialization }}`
+
+## Rules
+- ALWAYS call `get_context_capsule` via MCP before modifying any model
+- NEVER guess column values — use `get_model_details` to inspect the schema
+- BEFORE completing, verify test coverage with `get_test_coverage`
+- BEFORE refactoring, check blast radius with `get_impact_analysis`
+- Follow this project's naming and materialization conventions above
+
+## MCP Tools Available
+- `get_context_capsule(task)` — primary tool, returns pre-filtered context
+- `search_models(query)` — find models by name or description
+- `get_lineage(model_name)` — DAG traversal
+- `get_model_details(model_name)` — full SQL, columns, tests
+- `get_impact_analysis(model_name)` — blast radius
+- `get_test_coverage(model_name)` — test gaps
