@@ -143,6 +143,80 @@ class HybridSearch:
         ).fetchall()
         return [dict(r) for r in rows]
 
+    # ── Path and column search ───────────────────────────────────────────────
+
+    def resolve_file_paths(self, paths: list[str]) -> list[str]:
+        """Resolve file paths to model unique_ids.
+
+        Matches against models.file_path exactly, or by extracting the model
+        name from the path basename (strip .sql).
+        """
+        results: list[str] = []
+        seen: set[str] = set()
+        for path in paths:
+            # Try exact file_path match first
+            row = self._conn.execute(
+                "SELECT unique_id FROM models WHERE file_path = ?", (path,)
+            ).fetchone()
+            if row:
+                uid = row[0]
+                if uid not in seen:
+                    results.append(uid)
+                    seen.add(uid)
+                continue
+
+            # Try matching by basename (strip .sql extension)
+            basename = path.rsplit("/", 1)[-1]
+            if basename.endswith(".sql"):
+                model_name = basename[:-4]
+            elif basename.endswith(".yml") or basename.endswith(".yaml"):
+                continue  # Skip YAML files, they aren't models
+            else:
+                model_name = basename
+
+            row = self._conn.execute(
+                "SELECT unique_id FROM models WHERE lower(name) = lower(?)",
+                (model_name,),
+            ).fetchone()
+            if row:
+                uid = row[0]
+                if uid not in seen:
+                    results.append(uid)
+                    seen.add(uid)
+        return results
+
+    def find_by_column(self, column_name: str, limit: int = 20) -> list[dict[str, Any]]:
+        """Find models containing a column with the given name."""
+        # Escape LIKE wildcards so literal % and _ in column names are matched
+        escaped = column_name.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        rows = self._conn.execute(
+            """
+            SELECT DISTINCT m.unique_id, m.name, m.layer, m.description,
+                   c.name AS column_name, c.data_type
+            FROM columns c
+            JOIN models m ON m.unique_id = c.model_id
+            WHERE lower(c.name) LIKE lower(?) ESCAPE '\\'
+            ORDER BY m.centrality DESC
+            LIMIT ?
+            """,
+            (f"%{escaped}%", limit),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def find_by_path(self, path_pattern: str, limit: int = 20) -> list[dict[str, Any]]:
+        """Find models matching a file path pattern (supports LIKE % wildcards)."""
+        rows = self._conn.execute(
+            """
+            SELECT unique_id, name, layer, file_path, description
+            FROM models
+            WHERE file_path LIKE ?
+            ORDER BY name
+            LIMIT ?
+            """,
+            (path_pattern, limit),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
     # ── Model lookup ──────────────────────────────────────────────────────────
 
     def get_model_by_id(self, unique_id: str) -> dict[str, Any] | None:

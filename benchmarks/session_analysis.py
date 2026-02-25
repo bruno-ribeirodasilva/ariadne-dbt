@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
+import sqlite3
 import sys
 import tempfile
 from dataclasses import dataclass, field
@@ -57,6 +59,12 @@ MODEL_PATH_RE = re.compile(r"models/.*?/([a-z_][a-z0-9_]*)\.(?:sql|yml|yaml)", r
 # Also catch model names from ref() calls in bash/grep
 REF_RE = re.compile(r"""ref\(\s*['"]([a-z_][a-z0-9_]*)['"]""", re.IGNORECASE)
 
+# Task prefixes that indicate non-dbt sessions
+SKIP_TASK_PREFIXES = [
+    "<local",            # git worktree resumptions
+    "[Requested interr", # tool resumptions (incomplete task context)
+]
+
 
 # ── Data classes ───────────────────────────────────────────────────────────────
 
@@ -82,7 +90,9 @@ class SessionAnalysis:
 @dataclass
 class AriadneComparison:
     session: SessionAnalysis
+    focus_model: str | None
     ariadne_models: set[str]
+    ariadne_pivot_names: list[str]
     overlap: set[str]
     overlap_pct: float
     potential_savings: int  # context calls that could have been skipped
@@ -95,43 +105,37 @@ def _extract_models_from_input(tool_name: str, tool_input: dict) -> list[str]:
     """Extract dbt model names from a tool call's input."""
     models = set()
 
+    # Collect all string values from input for path-based extraction
+    string_vals: list[str] = []
+
     if tool_name == "Read":
-        fp = tool_input.get("file_path", "")
-        for m in MODEL_PATH_RE.findall(fp):
-            models.add(m)
+        string_vals.append(tool_input.get("file_path", ""))
 
     elif tool_name == "Grep":
-        path = tool_input.get("path", "")
-        pattern = tool_input.get("pattern", "")
-        glob_val = tool_input.get("glob", "")
-        for text in [path, pattern, glob_val]:
-            for m in MODEL_PATH_RE.findall(text):
-                models.add(m)
-            for m in REF_RE.findall(text):
-                models.add(m)
+        string_vals.extend([
+            tool_input.get("path", ""),
+            tool_input.get("pattern", ""),
+            tool_input.get("glob", ""),
+        ])
 
     elif tool_name == "Glob":
-        path = tool_input.get("path", "")
-        pattern = tool_input.get("pattern", "")
-        for text in [path, pattern]:
-            for m in MODEL_PATH_RE.findall(text):
-                models.add(m)
+        string_vals.extend([
+            tool_input.get("path", ""),
+            tool_input.get("pattern", ""),
+        ])
 
     elif tool_name == "Bash":
-        cmd = tool_input.get("command", "")
-        for m in MODEL_PATH_RE.findall(cmd):
-            models.add(m)
-        for m in REF_RE.findall(cmd):
-            models.add(m)
+        string_vals.append(tool_input.get("command", ""))
 
-    elif tool_name == "Edit":
-        fp = tool_input.get("file_path", "")
-        for m in MODEL_PATH_RE.findall(fp):
-            models.add(m)
+    elif tool_name in ("Edit", "Write"):
+        string_vals.append(tool_input.get("file_path", ""))
 
-    elif tool_name == "Write":
-        fp = tool_input.get("file_path", "")
-        for m in MODEL_PATH_RE.findall(fp):
+    for text in string_vals:
+        if not text:
+            continue
+        for m in MODEL_PATH_RE.findall(text):
+            models.add(m)
+        for m in REF_RE.findall(text):
             models.add(m)
 
     return list(models)
@@ -176,9 +180,41 @@ def _extract_initial_task(messages: list[dict]) -> str:
     return ""
 
 
+def _is_dbt_relevant_task(task: str) -> bool:
+    """Check if a task is likely about dbt model work (not a generic chat)."""
+    for prefix in SKIP_TASK_PREFIXES:
+        if task.startswith(prefix):
+            return False
+    return True
+
+
+def _detect_focus_model(task: str, index_model_names: set[str]) -> str | None:
+    """Try to extract a focus model name from the task text.
+
+    Looks for known model names mentioned in the task, returning the longest match
+    (most specific) as the focus model.
+    """
+    task_lower = task.lower()
+    # Replace common separators with spaces for matching
+    task_normalized = re.sub(r"[^a-z0-9_]", " ", task_lower)
+
+    matches: list[str] = []
+    for name in index_model_names:
+        name_lower = name.lower()
+        # Check if the model name appears as a word (or underscored token) in the task
+        if name_lower in task_normalized or name_lower in task_lower:
+            matches.append(name)
+
+    if not matches:
+        return None
+
+    # Return the longest match (most specific model name)
+    return max(matches, key=len)
+
+
 def parse_session(filepath: Path) -> SessionAnalysis | None:
     """Parse a JSONL session file into a SessionAnalysis."""
-    messages: list[dict] = []  # (role, content) from type=user/assistant
+    messages: list[dict] = []
     tool_calls: list[ToolCall] = []
     session_id = filepath.stem
 
@@ -247,7 +283,6 @@ def parse_session(filepath: Path) -> SessionAnalysis | None:
             impl_calls.append(tc)
         elif first_impl_seen:
             # After first impl, context calls are part of the implementation phase
-            # (e.g., reading a file to verify an edit) but we count them differently
             impl_calls.append(tc)
         else:
             context_calls.append(tc)
@@ -270,7 +305,7 @@ def parse_session(filepath: Path) -> SessionAnalysis | None:
 # ── Ariadne comparison ────────────────────────────────────────────────────────
 
 
-def build_ariadne_index(manifest_path: Path) -> tuple[Path, any]:
+def build_ariadne_index(manifest_path: Path) -> tuple[Path, str]:
     """Build the Ariadne index and return (db_path, tmpdir)."""
     tmpdir = tempfile.mkdtemp(prefix="ariadne_bench_")
     db_path = Path(tmpdir) / "ariadne.db"
@@ -285,16 +320,25 @@ def compare_with_ariadne(
     index_model_names: set[str],
 ) -> AriadneComparison | None:
     """Run Ariadne's capsule builder and compare with agent behavior."""
+    # Try to detect a focus model from the task text
+    focus_model = _detect_focus_model(session.task, index_model_names)
+
     try:
-        capsule = builder.build(task=session.task, token_budget=10000)
+        capsule = builder.build(
+            task=session.task,
+            focus_model=focus_model,
+            token_budget=10000,
+        )
     except Exception as e:
         console.print(f"  [dim red]Capsule build failed for {session.session_id}: {e}[/dim red]")
         return None
 
     # Collect all model names from Ariadne's capsule
     ariadne_models: set[str] = set()
+    pivot_names: list[str] = []
     for pm in capsule.pivot_models:
         ariadne_models.add(pm.name)
+        pivot_names.append(pm.name)
     for um in capsule.upstream_models:
         ariadne_models.add(um.name)
     for dm in capsule.downstream_models:
@@ -328,11 +372,33 @@ def compare_with_ariadne(
 
     return AriadneComparison(
         session=session,
+        focus_model=focus_model,
         ariadne_models=ariadne_models,
+        ariadne_pivot_names=pivot_names,
         overlap=overlap,
         overlap_pct=overlap_pct,
         potential_savings=savings,
     )
+
+
+# ── Display helpers ────────────────────────────────────────────────────────────
+
+
+def _overlap_style(pct: float) -> str:
+    if pct >= 75:
+        return "bold green"
+    elif pct >= 50:
+        return "yellow"
+    elif pct > 0:
+        return "bright_red"
+    return "red"
+
+
+def _truncate(text: str, length: int) -> str:
+    text = text.replace("\n", " ").strip()
+    if len(text) > length:
+        return text[:length] + "..."
+    return text
 
 
 # ── Main ───────────────────────────────────────────────────────────────────────
@@ -355,18 +421,24 @@ def main() -> None:
         console.print(f"[red]Error:[/red] Manifest not found: {MANIFEST_PATH}")
         sys.exit(1)
 
-    # Parse all sessions
+    # ── Phase 1: Parse sessions ───────────────────────────────────────────────
+
     console.print("\n[bold]Phase 1:[/bold] Parsing session transcripts...")
     session_files = sorted(SESSIONS_DIR.glob("*.jsonl"))
     console.print(f"  Found {len(session_files)} session files")
 
     all_sessions: list[SessionAnalysis] = []
+    skipped_non_dbt = 0
     for sf in session_files:
         session = parse_session(sf)
         if session:
-            all_sessions.append(session)
+            if _is_dbt_relevant_task(session.task):
+                all_sessions.append(session)
+            else:
+                skipped_non_dbt += 1
 
-    console.print(f"  Parsed {len(all_sessions)} sessions with identifiable tasks")
+    console.print(f"  Parsed {len(all_sessions)} dbt-relevant sessions "
+                  f"(skipped {skipped_non_dbt} non-dbt sessions)")
 
     # Filter to sessions with enough context-gathering calls and dbt model work
     qualifying = [
@@ -383,9 +455,9 @@ def main() -> None:
             console.print("[red]No sessions with dbt model references found.[/red]")
             sys.exit(0)
 
-    # Build Ariadne index
+    # ── Phase 2: Build Ariadne index ──────────────────────────────────────────
+
     console.print("\n[bold]Phase 2:[/bold] Building Ariadne index from manifest...")
-    import sqlite3
     db_path, tmpdir = build_ariadne_index(MANIFEST_PATH)
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
@@ -399,7 +471,8 @@ def main() -> None:
     config = CapsuleConfig()
     builder = CapsuleBuilder(conn, config)
 
-    # Compare each session with Ariadne
+    # ── Phase 3: Compare ──────────────────────────────────────────────────────
+
     console.print("\n[bold]Phase 3:[/bold] Comparing agent exploration vs Ariadne capsule...\n")
     comparisons: list[AriadneComparison] = []
 
@@ -418,7 +491,8 @@ def main() -> None:
 
     table = Table(title="Per-Session Analysis", border_style="green", show_lines=True)
     table.add_column("Session", style="dim", max_width=12, no_wrap=True)
-    table.add_column("Task", max_width=50)
+    table.add_column("Task", max_width=45)
+    table.add_column("Focus\nModel", max_width=20, style="cyan")
     table.add_column("Ctx\nCalls", justify="right", style="yellow")
     table.add_column("Agent\nModels", justify="right")
     table.add_column("Ariadne\nModels", justify="right", style="cyan")
@@ -428,25 +502,19 @@ def main() -> None:
 
     for c in comparisons:
         s = c.session
-        task_short = s.task[:80] + ("..." if len(s.task) > 80 else "")
+        task_short = _truncate(s.task, 60)
         agent_models_in_idx = s.models_explored & index_model_names
-
-        overlap_style = ""
-        if c.overlap_pct >= 75:
-            overlap_style = "bold green"
-        elif c.overlap_pct >= 50:
-            overlap_style = "yellow"
-        else:
-            overlap_style = "red"
+        style = _overlap_style(c.overlap_pct)
 
         table.add_row(
             s.session_id[:12],
             task_short,
+            c.focus_model or "-",
             str(len(s.context_calls)),
             str(len(agent_models_in_idx)),
             str(len(c.ariadne_models & index_model_names)),
             str(len(c.overlap)),
-            f"[{overlap_style}]{c.overlap_pct:.0f}%[/{overlap_style}]",
+            f"[{style}]{c.overlap_pct:.0f}%[/{style}]",
             str(c.potential_savings),
         )
 
@@ -454,56 +522,113 @@ def main() -> None:
 
     # ── Aggregate summary ──────────────────────────────────────────────────────
 
-    avg_ctx_calls = sum(len(c.session.context_calls) for c in comparisons) / len(comparisons)
-    avg_overlap = sum(c.overlap_pct for c in comparisons) / len(comparisons)
+    n = len(comparisons)
+    avg_ctx_calls = sum(len(c.session.context_calls) for c in comparisons) / n
+    avg_overlap = sum(c.overlap_pct for c in comparisons) / n
     total_savings = sum(c.potential_savings for c in comparisons)
     total_ctx_calls = sum(len(c.session.context_calls) for c in comparisons)
     savings_pct = (total_savings / total_ctx_calls * 100) if total_ctx_calls else 0
 
+    # Split by focus-model availability
+    with_focus = [c for c in comparisons if c.focus_model]
+    without_focus = [c for c in comparisons if not c.focus_model]
+
     summary = Table(title="Aggregate Summary", border_style="blue")
     summary.add_column("Metric", style="bold")
     summary.add_column("Value", justify="right")
-    summary.add_row("Sessions analyzed", str(len(comparisons)))
+    summary.add_row("Sessions analyzed", str(n))
     summary.add_row("Avg context calls / session", f"{avg_ctx_calls:.1f}")
     summary.add_row("Total context calls", str(total_ctx_calls))
     summary.add_row("Avg model overlap %", f"{avg_overlap:.1f}%")
     summary.add_row("Total saveable calls", str(total_savings))
     summary.add_row("Overall savings %", f"{savings_pct:.1f}%")
+    summary.add_row("", "")
+    summary.add_row("Sessions WITH focus model detected", str(len(with_focus)))
+    if with_focus:
+        avg_focus = sum(c.overlap_pct for c in with_focus) / len(with_focus)
+        focus_savings = sum(c.potential_savings for c in with_focus)
+        focus_ctx = sum(len(c.session.context_calls) for c in with_focus)
+        summary.add_row("  Avg overlap % (with focus)", f"{avg_focus:.1f}%")
+        summary.add_row("  Saveable calls (with focus)", f"{focus_savings}/{focus_ctx}")
+    summary.add_row("Sessions WITHOUT focus model", str(len(without_focus)))
+    if without_focus:
+        avg_nofocus = sum(c.overlap_pct for c in without_focus) / len(without_focus)
+        nofocus_savings = sum(c.potential_savings for c in without_focus)
+        nofocus_ctx = sum(len(c.session.context_calls) for c in without_focus)
+        summary.add_row("  Avg overlap % (no focus)", f"{avg_nofocus:.1f}%")
+        summary.add_row("  Saveable calls (no focus)", f"{nofocus_savings}/{nofocus_ctx}")
+
     console.print(summary)
 
     # ── Detailed overlap examples ──────────────────────────────────────────────
 
-    # Show top 3 sessions with best overlap for illustration
-    best = sorted(comparisons, key=lambda c: c.overlap_pct, reverse=True)[:3]
-    if best:
-        detail = Table(title="Top Overlap Sessions - Detail", border_style="magenta")
+    # Show top 5 sessions with best overlap for illustration
+    best = sorted(comparisons, key=lambda c: c.overlap_pct, reverse=True)[:5]
+    if best and best[0].overlap_pct > 0:
+        detail = Table(title="Top Overlap Sessions - Detail", border_style="magenta", show_lines=True)
         detail.add_column("Session", style="dim", max_width=12)
-        detail.add_column("Agent Models", max_width=40)
-        detail.add_column("Ariadne Models", max_width=40, style="cyan")
-        detail.add_column("Overlap", max_width=40, style="green")
+        detail.add_column("Focus", max_width=25, style="cyan")
+        detail.add_column("Agent Models", max_width=35)
+        detail.add_column("Ariadne Pivots", max_width=35, style="cyan")
+        detail.add_column("Overlap", max_width=35, style="green")
+        detail.add_column("%", justify="right", style="bold")
 
         for c in best:
+            if c.overlap_pct == 0:
+                continue
             agent_in_idx = sorted(c.session.models_explored & index_model_names)
-            ariadne_in_idx = sorted(c.ariadne_models & index_model_names)
             overlap_sorted = sorted(c.overlap)
+            style = _overlap_style(c.overlap_pct)
             detail.add_row(
                 c.session.session_id[:12],
-                ", ".join(agent_in_idx[:8]) + ("..." if len(agent_in_idx) > 8 else ""),
-                ", ".join(ariadne_in_idx[:8]) + ("..." if len(ariadne_in_idx) > 8 else ""),
-                ", ".join(overlap_sorted[:8]) + ("..." if len(overlap_sorted) > 8 else ""),
+                c.focus_model or "-",
+                "\n".join(agent_in_idx[:6]) + ("\n..." if len(agent_in_idx) > 6 else ""),
+                "\n".join(c.ariadne_pivot_names[:4]),
+                "\n".join(overlap_sorted[:6]) + ("\n..." if len(overlap_sorted) > 6 else ""),
+                f"[{style}]{c.overlap_pct:.0f}%[/{style}]",
             )
         console.print(detail)
 
-    # ── All sessions overview (including non-qualifying) ───────────────────────
+    # ── Zero-overlap diagnosis ────────────────────────────────────────────────
+
+    zero_overlap = [c for c in comparisons if c.overlap_pct == 0 and len(c.session.models_explored & index_model_names) > 0]
+    if zero_overlap:
+        diag = Table(title="Zero-Overlap Diagnosis (agent found models but Ariadne missed)",
+                     border_style="red", show_lines=True)
+        diag.add_column("Session", style="dim", max_width=12)
+        diag.add_column("Task Snippet", max_width=40)
+        diag.add_column("Agent Models (in index)", max_width=35)
+        diag.add_column("Ariadne Pivots", max_width=35, style="cyan")
+        diag.add_column("Reason", max_width=25, style="dim")
+
+        for c in zero_overlap[:8]:
+            agent_in_idx = sorted(c.session.models_explored & index_model_names)
+            # Diagnose why
+            if not c.ariadne_models & index_model_names:
+                reason = "Ariadne found 0 models"
+            elif not c.focus_model:
+                reason = "No focus model detected"
+            else:
+                reason = "Focus model mismatch"
+            diag.add_row(
+                c.session.session_id[:12],
+                _truncate(c.session.task, 55),
+                "\n".join(agent_in_idx[:5]) + ("\n..." if len(agent_in_idx) > 5 else ""),
+                "\n".join(c.ariadne_pivot_names[:3]),
+                reason,
+            )
+        console.print(diag)
+
+    # ── All sessions overview ─────────────────────────────────────────────────
 
     overview = Table(title="All Sessions Overview", border_style="dim")
     overview.add_column("Metric", style="bold")
     overview.add_column("Count", justify="right")
     overview.add_row("Total session files", str(len(session_files)))
-    overview.add_row("Sessions with tasks", str(len(all_sessions)))
-    overview.add_row("Sessions with dbt models", str(len([s for s in all_sessions if s.models_explored])))
+    overview.add_row("Sessions with tasks (dbt-relevant)", str(len(all_sessions)))
+    overview.add_row("Sessions with dbt model refs", str(len([s for s in all_sessions if s.models_explored])))
     overview.add_row(f"Sessions with >= {MIN_CONTEXT_CALLS} ctx calls + models", str(len(qualifying)))
-    overview.add_row("Successful comparisons", str(len(comparisons)))
+    overview.add_row("Successful comparisons", str(n))
 
     # Distribution of context calls
     if all_sessions:
@@ -515,8 +640,24 @@ def main() -> None:
 
     console.print(overview)
 
+    # ── Key Insight ───────────────────────────────────────────────────────────
+
+    console.print(Panel(
+        "[bold]Key Insights[/bold]\n\n"
+        f"  Ariadne analyzed {n} real agent sessions that involved dbt model exploration.\n"
+        f"  Average context-gathering calls per session: [yellow]{avg_ctx_calls:.1f}[/yellow]\n"
+        f"  Average model overlap (Ariadne vs agent): [bold]{avg_overlap:.1f}%[/bold]\n"
+        + (f"  With focus model: [bold green]{sum(c.overlap_pct for c in with_focus) / len(with_focus):.1f}%[/bold green] overlap ({len(with_focus)} sessions)\n" if with_focus else "")
+        + (f"  Without focus model: [bold red]{sum(c.overlap_pct for c in without_focus) / len(without_focus):.1f}%[/bold red] overlap ({len(without_focus)} sessions)\n" if without_focus else "")
+        + f"\n  Potential to save {total_savings} of {total_ctx_calls} context-gathering calls ({savings_pct:.1f}%)\n"
+        "  across all analyzed sessions.\n\n"
+        "  [dim]Note: Many sessions involve PR reviews or external tool lookups where\n"
+        "  the task text alone is insufficient for Ariadne to determine relevant models.\n"
+        "  Sessions with explicit model names in the task show much higher overlap.[/dim]",
+        border_style="green",
+    ))
+
     # Clean up
-    import shutil
     shutil.rmtree(tmpdir, ignore_errors=True)
 
 

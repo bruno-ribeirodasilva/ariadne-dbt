@@ -90,3 +90,61 @@ class TestCapsuleBuilder:
         pivot_ids = {p.unique_id for p in capsule.pivot_models}
         downstream_ids = {d.unique_id for d in capsule.downstream_models}
         assert not pivot_ids.intersection(downstream_ids)
+
+    # ── entry_models / entry_paths ───────────────────────────────────────
+
+    def test_entry_models_become_pivots(self, indexed_db):
+        builder = CapsuleBuilder(indexed_db)
+        capsule = builder.build(
+            "review PR changes",
+            entry_models=["fct_orders", "stg_payments"],
+        )
+        pivot_names = [p.name for p in capsule.pivot_models]
+        assert "fct_orders" in pivot_names
+        assert "stg_payments" in pivot_names
+
+    def test_entry_paths_resolve_to_pivots(self, indexed_db):
+        builder = CapsuleBuilder(indexed_db)
+        capsule = builder.build(
+            "review PR changes",
+            entry_paths=["models/marts/fct_orders.sql"],
+        )
+        pivot_names = [p.name for p in capsule.pivot_models]
+        assert "fct_orders" in pivot_names
+
+    def test_entry_models_combined_with_focus(self, indexed_db):
+        builder = CapsuleBuilder(indexed_db)
+        capsule = builder.build(
+            "refactor models",
+            focus_model="dim_customers",
+            entry_models=["fct_orders"],
+        )
+        pivot_names = [p.name for p in capsule.pivot_models]
+        assert "dim_customers" in pivot_names
+        assert "fct_orders" in pivot_names
+
+    # ── Confidence scoring ───────────────────────────────────────────────
+
+    def test_confidence_high_with_focus_model(self, indexed_db):
+        builder = CapsuleBuilder(indexed_db)
+        capsule = builder.build("do something", focus_model="fct_orders")
+        assert capsule.confidence == "high"
+        assert capsule.suggested_refinements == []
+
+    def test_confidence_high_with_entry_models(self, indexed_db):
+        builder = CapsuleBuilder(indexed_db)
+        capsule = builder.build("review PR", entry_models=["fct_orders"])
+        assert capsule.confidence == "high"
+
+    def test_confidence_low_with_vague_task(self, indexed_db):
+        builder = CapsuleBuilder(indexed_db)
+        capsule = builder.build("something completely unrelated to dbt models xyzzy")
+        assert capsule.confidence in ("low", "medium")
+        if capsule.confidence == "low":
+            assert len(capsule.suggested_refinements) > 0
+
+    def test_confidence_field_always_present(self, indexed_db):
+        builder = CapsuleBuilder(indexed_db)
+        capsule = builder.build("modify fct_orders")
+        assert capsule.confidence in ("high", "medium", "low")
+        assert isinstance(capsule.suggested_refinements, list)

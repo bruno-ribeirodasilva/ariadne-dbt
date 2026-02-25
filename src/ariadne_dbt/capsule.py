@@ -137,6 +137,8 @@ class CapsuleBuilder:
         self,
         task: str,
         focus_model: str | None = None,
+        entry_models: list[str] | None = None,
+        entry_paths: list[str] | None = None,
         token_budget: int | None = None,
     ) -> ContextCapsule:
         budget = token_budget or self._config.default_token_budget
@@ -144,7 +146,9 @@ class CapsuleBuilder:
         depths: IntentDepth = self._config.intent_depths.get(intent, IntentDepth())
 
         # ── Step 1: Select pivot models ───────────────────────────────────────
-        pivot_ids = self._select_pivots(task, intent, focus_model)
+        pivot_ids, confidence, suggested_refinements = self._select_pivots(
+            task, intent, focus_model, entry_models, entry_paths,
+        )
 
         # ── Step 2: DAG traversal ─────────────────────────────────────────────
         upstream_ids: dict[str, int] = {}
@@ -195,33 +199,109 @@ class CapsuleBuilder:
             similar_models=similar_names,
             patterns=patterns_dict,
             budget=budget,
+            confidence=confidence,
+            suggested_refinements=suggested_refinements,
         )
         return capsule
 
     # ── Pivot selection ───────────────────────────────────────────────────────
 
-    def _select_pivots(self, task: str, intent: str, focus_model: str | None) -> list[str]:
-        pivot_ids: list[str] = []
+    def _select_pivots(
+        self,
+        task: str,
+        intent: str,
+        focus_model: str | None,
+        entry_models: list[str] | None = None,
+        entry_paths: list[str] | None = None,
+    ) -> tuple[list[str], str, list[str]]:
+        """Select pivot models and compute confidence.
 
+        Returns:
+            (pivot_ids, confidence, suggested_refinements)
+        """
+        pivot_ids: list[str] = []
+        seen: set[str] = set()
+        has_explicit_entry = False
+
+        def _add_pivot(uid: str) -> None:
+            if uid not in seen and len(pivot_ids) < self._config.max_pivots:
+                pivot_ids.append(uid)
+                seen.add(uid)
+
+        # 1. Resolve focus_model (highest priority)
         if focus_model:
-            # Try by name first, then by unique_id
             row = self._search.get_model_by_name(focus_model) or self._search.get_model_by_id(focus_model)
             if row:
-                pivot_ids.append(row["unique_id"])
+                _add_pivot(row["unique_id"])
+                has_explicit_entry = True
 
+        # 2. Resolve entry_models (same priority as focus_model)
+        if entry_models:
+            for name in entry_models:
+                row = self._search.get_model_by_name(name) or self._search.get_model_by_id(name)
+                if row:
+                    _add_pivot(row["unique_id"])
+                    has_explicit_entry = True
+
+        # 3. Resolve entry_paths → model unique_ids
+        if entry_paths:
+            resolved_ids = self._search.resolve_file_paths(entry_paths)
+            for uid in resolved_ids:
+                _add_pivot(uid)
+                has_explicit_entry = True
+
+        # 4. Fill remaining slots with search if under max_pivots
+        search_bm25_scores: list[float] = []
         if len(pivot_ids) < self._config.max_pivots:
-            exclude = set(pivot_ids)
             results = self._search.search(
                 task, intent=intent,
                 limit=self._config.max_pivots - len(pivot_ids) + 2,
-                exclude_ids=exclude,
+                exclude_ids=seen,
             )
+            search_bm25_scores = [r.bm25_score for r in results]
             for r in results:
-                if len(pivot_ids) >= self._config.max_pivots:
-                    break
-                pivot_ids.append(r.unique_id)
+                _add_pivot(r.unique_id)
 
-        return pivot_ids
+        # 5. Compute confidence
+        confidence, suggested_refinements = self._compute_confidence(
+            has_explicit_entry, search_bm25_scores,
+        )
+
+        return pivot_ids, confidence, suggested_refinements
+
+    @staticmethod
+    def _compute_confidence(
+        has_explicit_entry: bool,
+        search_bm25_scores: list[float],
+    ) -> tuple[str, list[str]]:
+        """Compute confidence level based on how pivots were selected.
+
+        - Explicit entries (focus_model, entry_models, entry_paths) → "high"
+        - 3+ BM25 results where top > 2× third → "high"
+        - 3+ BM25 results where top > 1.5× third → "medium"
+        - 1-2 strong BM25 results (score > 5.0) → "medium"
+        - Otherwise → "low" with suggested refinements
+        """
+        if has_explicit_entry:
+            return "high", []
+
+        if len(search_bm25_scores) >= 3:
+            top = search_bm25_scores[0]
+            third = search_bm25_scores[2]
+            if third > 0 and top / third > 2.0:
+                return "high", []
+            elif third > 0 and top / third > 1.5:
+                return "medium", []
+        elif search_bm25_scores and search_bm25_scores[0] > 5.0:
+            # Only 1-2 results but the top one is a strong match
+            return "medium", []
+
+        # Low confidence — provide refinement hints
+        return "low", [
+            "Try calling with focus_model='model_name' if you know the target model",
+            "Try find_models_by_column('column_name') to search by business concept",
+            "Try find_models_by_path('models/marts/...') to search by directory",
+        ]
 
     # ── Assembly + token budgeting ────────────────────────────────────────────
 
@@ -238,6 +318,8 @@ class CapsuleBuilder:
         similar_models: list[str],
         patterns: dict[str, Any],
         budget: int,
+        confidence: str = "high",
+        suggested_refinements: list[str] | None = None,
     ) -> ContextCapsule:
         # Budget allocation
         alloc = {
@@ -339,6 +421,8 @@ class CapsuleBuilder:
             project_patterns=patterns,
             similar_models=similar_models,
             session_context={},
+            confidence=confidence,
+            suggested_refinements=suggested_refinements or [],
             token_estimate=total_tokens,
             token_budget=budget,
         )

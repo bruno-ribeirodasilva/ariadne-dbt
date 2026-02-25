@@ -111,3 +111,83 @@ class TestHybridSearch:
         assert len(sources) >= 1
         source_names = [s["name"] for s in sources]
         assert "orders" in source_names
+
+    # ── resolve_file_paths ───────────────────────────────────────────────
+
+    def test_resolve_file_paths_by_basename(self, indexed_db):
+        search = HybridSearch(indexed_db)
+        resolved = search.resolve_file_paths(["models/marts/fct_orders.sql"])
+        assert len(resolved) == 1
+        assert resolved[0] == "model.jaffle_shop.fct_orders"
+
+    def test_resolve_file_paths_multiple(self, indexed_db):
+        search = HybridSearch(indexed_db)
+        resolved = search.resolve_file_paths([
+            "models/marts/fct_orders.sql",
+            "models/staging/stg_orders.sql",
+        ])
+        assert len(resolved) == 2
+        names = set(resolved)
+        assert "model.jaffle_shop.fct_orders" in names
+        assert "model.jaffle_shop.stg_orders" in names
+
+    def test_resolve_file_paths_yaml_skipped(self, indexed_db):
+        search = HybridSearch(indexed_db)
+        resolved = search.resolve_file_paths(["models/marts/_marts.yml"])
+        assert len(resolved) == 0
+
+    def test_resolve_file_paths_nonexistent(self, indexed_db):
+        search = HybridSearch(indexed_db)
+        resolved = search.resolve_file_paths(["models/nonexistent_model.sql"])
+        assert len(resolved) == 0
+
+    def test_resolve_file_paths_deduplicates(self, indexed_db):
+        search = HybridSearch(indexed_db)
+        resolved = search.resolve_file_paths([
+            "models/marts/fct_orders.sql",
+            "some/other/path/fct_orders.sql",
+        ])
+        assert len(resolved) == 1
+
+    # ── find_by_column ───────────────────────────────────────────────────
+
+    def test_find_by_column_order_id(self, indexed_db):
+        search = HybridSearch(indexed_db)
+        results = search.find_by_column("order_id")
+        assert len(results) > 0
+        model_names = [r["name"] for r in results]
+        assert any("order" in name for name in model_names)
+
+    def test_find_by_column_partial_match(self, indexed_db):
+        search = HybridSearch(indexed_db)
+        results = search.find_by_column("amount")
+        assert len(results) > 0
+
+    def test_find_by_column_no_results(self, indexed_db):
+        search = HybridSearch(indexed_db)
+        results = search.find_by_column("zzz_nonexistent_column_zzz")
+        assert len(results) == 0
+
+    def test_find_by_column_respects_limit(self, indexed_db):
+        search = HybridSearch(indexed_db)
+        results = search.find_by_column("id", limit=1)
+        assert len(results) <= 1
+
+    # ── find_by_path ─────────────────────────────────────────────────────
+
+    def test_find_by_path_wildcard(self, indexed_db):
+        search = HybridSearch(indexed_db)
+        results = search.find_by_path("%staging%")
+        assert len(results) > 0
+        for r in results:
+            assert "staging" in r["file_path"].lower()
+
+    def test_find_by_path_no_results(self, indexed_db):
+        search = HybridSearch(indexed_db)
+        results = search.find_by_path("nonexistent_dir/%")
+        assert len(results) == 0
+
+    def test_find_by_path_respects_limit(self, indexed_db):
+        search = HybridSearch(indexed_db)
+        results = search.find_by_path("%", limit=2)
+        assert len(results) <= 2

@@ -31,8 +31,11 @@ def create_server(config: EngineConfig | None = None) -> FastMCP:
         name="ariadne",
         instructions=(
             "Intelligent context server for dbt projects. "
-            "Use get_context_capsule as the primary tool — it returns a pre-filtered, "
-            "token-budgeted context package for any dbt task. "
+            "Start with get_context_capsule — pass entry_models or entry_paths if you "
+            "already know which models are involved (e.g., from a PR diff or file path). "
+            "Use find_models_by_path or find_models_by_column to discover models when "
+            "the task is vague. Use get_impact_analysis before refactoring. "
+            "Check the 'confidence' field — if low, refine with a more specific query. "
             "Call refresh_index after running dbt compile to keep the index current. "
             "Call rate_capsule after completing a task to record whether the context was useful."
         ),
@@ -44,6 +47,8 @@ def create_server(config: EngineConfig | None = None) -> FastMCP:
     def get_context_capsule(
         task: str,
         focus_model: str | None = None,
+        entry_models: list[str] | None = None,
+        entry_paths: list[str] | None = None,
         token_budget: int = 10000,
     ) -> dict[str, Any]:
         """THE primary tool. Call this first for any dbt task.
@@ -61,17 +66,30 @@ def create_server(config: EngineConfig | None = None) -> FastMCP:
                   Examples: "add monthly revenue metric", "debug failing test on fct_orders",
                   "refactor stg_stripe__charges", "document the fct_revenue model"
             focus_model: Optional model name to anchor the search (e.g., "fct_orders")
+            entry_models: Optional list of model names to include as pivots
+                          (e.g., discovered from a PR diff or Jira ticket).
+                          These become guaranteed pivots alongside focus_model.
+            entry_paths: Optional list of file paths to resolve to models
+                         (e.g., ["models/marts/finance/fct_revenue.sql"]).
+                         Resolved to model unique_ids by matching file_path or basename.
             token_budget: Maximum tokens for the response (default: 10000)
 
         Returns:
             Structured context capsule with pivot_models, upstream_models,
             downstream_models, relevant_tests, relevant_macros, relevant_sources,
-            project_patterns, similar_models, token_estimate
+            project_patterns, similar_models, confidence, suggested_refinements,
+            token_estimate
         """
         conn = _get_conn(db_path)
         builder = CapsuleBuilder(conn, cfg.capsule)
         t0 = time.perf_counter()
-        capsule = builder.build(task=task, focus_model=focus_model, token_budget=token_budget)
+        capsule = builder.build(
+            task=task,
+            focus_model=focus_model,
+            entry_models=entry_models,
+            entry_paths=entry_paths,
+            token_budget=token_budget,
+        )
         duration_ms = round((time.perf_counter() - t0) * 1000)
         log_id = UsageLogger(conn).log(
             "get_context_capsule",
@@ -218,6 +236,38 @@ def create_server(config: EngineConfig | None = None) -> FastMCP:
 
         return result
 
+    # ── Tool: get_impact_analysis ────────────────────────────────────────────
+
+    @mcp.tool()
+    def get_impact_analysis(
+        model_name: str,
+        depth: int = 5,
+    ) -> dict[str, Any]:
+        """Blast radius analysis for changing a model.
+
+        Returns affected downstream models, tests, exposures, and a risk level
+        (low/medium/high). Use this before refactoring or modifying a model.
+
+        Args:
+            model_name: Model name (e.g., "fct_orders") or unique_id
+            depth: Maximum downstream hops to analyze (default: 5, max: 10)
+
+        Returns:
+            Dict with target, affected_models, affected_tests,
+            affected_exposures, and risk_level
+        """
+        conn = _get_conn(db_path)
+        search = HybridSearch(conn)
+        graph = GraphOps(conn)
+
+        row = search.get_model_by_name(model_name) or search.get_model_by_id(model_name)
+        if not row:
+            return {"error": f"Model '{model_name}' not found. Use search_models to find similar names."}
+
+        uid = row["unique_id"]
+        depth = min(max(1, depth), 10)
+        return graph.impact_analysis(uid, max_depth=depth)
+
     # ── Tool: search_models ───────────────────────────────────────────────────
 
     @mcp.tool()
@@ -271,6 +321,57 @@ def create_server(config: EngineConfig | None = None) -> FastMCP:
                 }
                 for r in results
             ],
+        }
+
+    # ── Tool: find_models_by_column ──────────────────────────────────────────
+
+    @mcp.tool()
+    def find_models_by_column(column_name: str, limit: int = 20) -> dict[str, Any]:
+        """Find all models containing a specific column name.
+
+        Useful when you know a business concept (e.g., "revenue", "customer_id")
+        but not which model contains it. Supports partial matching.
+
+        Args:
+            column_name: Column name or partial name to search for
+            limit: Maximum results (default: 20, max: 50)
+
+        Returns:
+            List of models with matching column details
+        """
+        conn = _get_conn(db_path)
+        search = HybridSearch(conn)
+        limit = min(max(1, limit), 50)
+        results = search.find_by_column(column_name, limit=limit)
+        return {
+            "column_name": column_name,
+            "count": len(results),
+            "results": results,
+        }
+
+    # ── Tool: find_models_by_path ─────────────────────────────────────────
+
+    @mcp.tool()
+    def find_models_by_path(path_pattern: str, limit: int = 20) -> dict[str, Any]:
+        """Find models by file path or directory pattern.
+
+        Examples: "models/marts/finance/%", "stg_stripe%", "%revenue%"
+
+        Args:
+            path_pattern: SQL LIKE pattern for file_path matching (use % as wildcard)
+            limit: Maximum results (default: 20, max: 50)
+
+        Returns:
+            List of models matching the path pattern
+        """
+        conn = _get_conn(db_path)
+        search = HybridSearch(conn)
+        limit = min(max(1, limit), 50)
+        results = search.find_by_path(path_pattern, limit=limit)
+        return {
+            "path_pattern": path_pattern,
+            "count": len(results),
+            "results": results,
         }
 
     # ── Tool: refresh_index ───────────────────────────────────────────────────

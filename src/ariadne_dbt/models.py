@@ -182,6 +182,8 @@ class ContextCapsule(BaseModel):
     project_patterns: dict[str, Any] = Field(default_factory=dict)
     similar_models: list[str] = Field(default_factory=list)
     session_context: dict[str, Any] = Field(default_factory=dict)
+    confidence: str = "high"  # "high" | "medium" | "low"
+    suggested_refinements: list[str] = Field(default_factory=list)
     token_estimate: int = 0
     token_budget: int = 10000
 
