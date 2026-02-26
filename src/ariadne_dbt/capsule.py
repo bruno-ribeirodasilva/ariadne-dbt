@@ -427,6 +427,79 @@ class CapsuleBuilder:
             token_budget=budget,
         )
 
+    # ── Discover (names-only) ────────────────────────────────────────────────
+
+    def discover(
+        self,
+        task: str,
+        focus_model: str | None = None,
+        entry_models: list[str] | None = None,
+        entry_paths: list[str] | None = None,
+        limit: int = 40,
+    ) -> list[dict[str, Any]]:
+        """Return a broad set of model names with minimal detail.
+
+        Uses the same pivot selection as build() but traverses the DAG deeper
+        (depth 4) and returns only names/layers/distances — no SQL, columns, or
+        tests.  Costs ~500 tokens for 40 models vs ~10K for a full capsule.
+        """
+        intent = detect_intent(task)
+
+        # Reuse pivot selection (capped to 5 for broader coverage)
+        old_max = self._config.max_pivots
+        self._config.max_pivots = max(old_max, 5)
+        pivot_ids, confidence, _ = self._select_pivots(
+            task, intent, focus_model, entry_models, entry_paths,
+        )
+        self._config.max_pivots = old_max
+
+        result: list[dict[str, Any]] = []
+        seen: set[str] = set()
+
+        def _add(uid: str, relationship: str, distance: int) -> None:
+            if uid in seen or len(result) >= limit:
+                return
+            row = self._conn.execute(
+                "SELECT name, layer, file_path FROM models WHERE unique_id = ?",
+                (uid,),
+            ).fetchone()
+            if not row:
+                return
+            seen.add(uid)
+            result.append({
+                "unique_id": uid,
+                "name": row[0],
+                "layer": row[1] or "other",
+                "file_path": row[2] or "",
+                "relationship": relationship,
+                "distance": distance,
+            })
+
+        # 1. Pivots
+        for pid in pivot_ids:
+            _add(pid, "pivot", 0)
+
+        # 2. DAG traversal at depth 4 (deeper than the capsule's 1-2)
+        for pid in pivot_ids:
+            for uid, dist in self._graph.upstream(pid, depth=4):
+                if uid.startswith("model."):
+                    _add(uid, "upstream", dist)
+            for uid, dist in self._graph.downstream(pid, depth=4):
+                if uid.startswith("model."):
+                    _add(uid, "downstream", dist)
+
+        # 3. Fill remaining slots with FTS search (catches disconnected areas)
+        if len(result) < limit:
+            extra = self._search.search(
+                task, intent=intent,
+                limit=limit - len(result) + 5,
+                exclude_ids=seen,
+            )
+            for r in extra:
+                _add(r.unique_id, "search", -1)
+
+        return result[:limit]
+
     # ── Helpers ───────────────────────────────────────────────────────────────
 
     def _get_model_row(self, unique_id: str) -> dict[str, Any] | None:

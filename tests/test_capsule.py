@@ -148,3 +148,72 @@ class TestCapsuleBuilder:
         capsule = builder.build("modify fct_orders")
         assert capsule.confidence in ("high", "medium", "low")
         assert isinstance(capsule.suggested_refinements, list)
+
+
+class TestDiscover:
+    def test_discover_returns_models(self, indexed_db):
+        builder = CapsuleBuilder(indexed_db)
+        result = builder.discover("work with orders")
+        assert len(result) > 0
+
+    def test_discover_has_required_fields(self, indexed_db):
+        builder = CapsuleBuilder(indexed_db)
+        result = builder.discover("work with orders")
+        for m in result:
+            assert "unique_id" in m
+            assert "name" in m
+            assert "layer" in m
+            assert "file_path" in m
+            assert "relationship" in m
+            assert "distance" in m
+
+    def test_discover_focus_model_is_pivot(self, indexed_db):
+        builder = CapsuleBuilder(indexed_db)
+        result = builder.discover("do something", focus_model="fct_orders")
+        pivots = [m for m in result if m["relationship"] == "pivot"]
+        pivot_names = [m["name"] for m in pivots]
+        assert "fct_orders" in pivot_names
+
+    def test_discover_entry_models_are_pivots(self, indexed_db):
+        builder = CapsuleBuilder(indexed_db)
+        result = builder.discover(
+            "review PR",
+            entry_models=["fct_orders", "stg_payments"],
+        )
+        pivot_names = [m["name"] for m in result if m["relationship"] == "pivot"]
+        assert "fct_orders" in pivot_names
+        assert "stg_payments" in pivot_names
+
+    def test_discover_includes_dag_neighbors(self, indexed_db):
+        builder = CapsuleBuilder(indexed_db)
+        result = builder.discover("work on orders", focus_model="fct_orders")
+        relationships = {m["relationship"] for m in result}
+        # Should have pivot + at least upstream or downstream
+        assert "pivot" in relationships
+        assert "upstream" in relationships or "downstream" in relationships
+
+    def test_discover_respects_limit(self, indexed_db):
+        builder = CapsuleBuilder(indexed_db)
+        result = builder.discover("orders", limit=2)
+        assert len(result) <= 2
+
+    def test_discover_no_duplicate_models(self, indexed_db):
+        builder = CapsuleBuilder(indexed_db)
+        result = builder.discover("orders and customers")
+        names = [m["unique_id"] for m in result]
+        assert len(names) == len(set(names))
+
+    def test_discover_broader_than_capsule(self, indexed_db):
+        builder = CapsuleBuilder(indexed_db)
+        discovery = builder.discover("work with orders", focus_model="fct_orders")
+        capsule = builder.build("work with orders", focus_model="fct_orders")
+        capsule_names = set()
+        for pm in capsule.pivot_models:
+            capsule_names.add(pm.name)
+        for um in capsule.upstream_models:
+            capsule_names.add(um.name)
+        for dm in capsule.downstream_models:
+            capsule_names.add(dm.name)
+        discovery_names = {m["name"] for m in discovery}
+        # Discovery should cover at least as many models as capsule
+        assert len(discovery_names) >= len(capsule_names)

@@ -30,14 +30,22 @@ def create_server(config: EngineConfig | None = None) -> FastMCP:
     mcp = FastMCP(
         name="ariadne",
         instructions=(
-            "Intelligent context server for dbt projects. "
-            "Start with get_context_capsule — pass entry_models or entry_paths if you "
-            "already know which models are involved (e.g., from a PR diff or file path). "
-            "Use find_models_by_path or find_models_by_column to discover models when "
-            "the task is vague. Use get_impact_analysis before refactoring. "
-            "Check the 'confidence' field — if low, refine with a more specific query. "
-            "Call refresh_index after running dbt compile to keep the index current. "
-            "Call rate_capsule after completing a task to record whether the context was useful."
+            "Intelligent context server for dbt projects.\n\n"
+            "RECOMMENDED WORKFLOW:\n"
+            "1. Call discover_models first — it returns up to 40 model names cheaply (~500 tokens). "
+            "   Pass task text, plus entry_models/entry_paths if you have them from a PR diff.\n"
+            "2. Pick the models you need from the discovery list.\n"
+            "3. Call get_context_capsule with those models as entry_models for full details.\n"
+            "4. If you discover MORE models while working, call get_context_capsule AGAIN "
+            "   with the new models as entry_models — it's designed for iterative use.\n\n"
+            "OTHER TOOLS:\n"
+            "- find_models_by_column / find_models_by_path: discover models by column name or file path\n"
+            "- get_model_details: full details for a single model\n"
+            "- get_lineage: DAG upstream/downstream for a model\n"
+            "- get_impact_analysis: blast radius before refactoring\n"
+            "- search_models: text search across model names/descriptions/SQL\n"
+            "- refresh_index: re-index after dbt compile\n"
+            "- rate_capsule: rate whether the context was useful (helps improve Ariadne)"
         ),
     )
 
@@ -102,6 +110,68 @@ def create_server(config: EngineConfig | None = None) -> FastMCP:
         )
         _last_capsule_log_id[db_path] = log_id
         return capsule.model_dump()
+
+    # ── Tool: discover_models ──────────────────────────────────────────────────
+
+    @mcp.tool()
+    def discover_models(
+        task: str,
+        focus_model: str | None = None,
+        entry_models: list[str] | None = None,
+        entry_paths: list[str] | None = None,
+        limit: int = 40,
+    ) -> dict[str, Any]:
+        """Broad, cheap model discovery — returns up to 40 model names (~500 tokens).
+
+        Call this FIRST to see which models are relevant to your task, then pass
+        the ones you need as entry_models to get_context_capsule for full details.
+
+        Returns model names, layers, file paths, and their relationship to the
+        task (pivot, upstream, downstream, or search match). No SQL, no columns,
+        no tests — just names for orientation.
+
+        Args:
+            task: Natural language description of what you want to do.
+            focus_model: Optional model name to anchor the search.
+            entry_models: Optional list of model names already known
+                          (e.g., from a PR diff or previous discovery).
+            entry_paths: Optional list of file paths to resolve to models.
+            limit: Maximum models to return (default: 40, max: 80).
+
+        Returns:
+            Dict with models list, each containing unique_id, name, layer,
+            file_path, relationship (pivot/upstream/downstream/search),
+            and distance from pivot.
+        """
+        conn = _get_conn(db_path)
+        builder = CapsuleBuilder(conn, cfg.capsule)
+        limit = min(max(1, limit), 80)
+        t0 = time.perf_counter()
+        models = builder.discover(
+            task=task,
+            focus_model=focus_model,
+            entry_models=entry_models,
+            entry_paths=entry_paths,
+            limit=limit,
+        )
+        duration_ms = round((time.perf_counter() - t0) * 1000)
+        UsageLogger(conn).log(
+            "discover_models",
+            task_text=task,
+            focus_model=focus_model,
+            pivot_count=sum(1 for m in models if m["relationship"] == "pivot"),
+            token_estimate=len(models) * 12,  # ~12 tokens per name entry
+            duration_ms=duration_ms,
+        )
+        return {
+            "task": task,
+            "count": len(models),
+            "models": models,
+            "hint": (
+                "Pass model names you need as entry_models to get_context_capsule "
+                "for full details (SQL, columns, tests)."
+            ),
+        }
 
     # ── Tool: get_model_details ───────────────────────────────────────────────
 
